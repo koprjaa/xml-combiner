@@ -1,5 +1,5 @@
 """
-Project: xml_combine
+Project: xml-combiner
 File: main.py
 Description: Command-line entry point for the XML combiner application.
 Author: Jan Alexandr Kopřiva jan.alexandr.kopriva@gmail.com

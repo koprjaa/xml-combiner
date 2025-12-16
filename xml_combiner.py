@@ -1,5 +1,5 @@
 """
-Project: xml_combine
+Project: xml-combiner
 File: xml_combiner.py
 Description: Core module for combining multiple XML files into a single XML file.
 Author: Jan Alexandr Kopřiva jan.alexandr.kopriva@gmail.com
