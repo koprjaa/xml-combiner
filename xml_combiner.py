@@ -17,6 +17,13 @@ import xml.sax
 from xml.sax.handler import ContentHandler
 import io
 
+# Use defusedxml to defend against entity-expansion ("billion laughs")
+# and external-entity DoS attacks when parsing untrusted input files.
+# These are drop-in replacements for the stdlib parsers used below.
+from defusedxml.ElementTree import parse as ET_parse
+from defusedxml.ElementTree import iterparse as ET_iterparse
+import defusedxml.sax
+
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +165,7 @@ class XMLCombiner:
             
             # Basic validation - full XSD validation would require lxml
             # For now, we just check if file is well-formed
-            ET.parse(xml_file)
+            ET_parse(xml_file)
             logger.debug(f"Validated {xml_file.name}")
             return True
         except ET.ParseError as e:
@@ -202,7 +209,7 @@ class XMLCombiner:
             try:
                 # First, check for multiple root elements using SAX
                 handler = MultiRootHandler()
-                parser = xml.sax.make_parser()
+                parser = defusedxml.sax.make_parser()
                 parser.setContentHandler(handler)
                 parser.setFeature(xml.sax.handler.feature_namespaces, True)
                 
@@ -218,7 +225,7 @@ class XMLCombiner:
                         # Try to parse as single root first (most common case)
                         # If that fails, handle multiple roots
                         try:
-                            tree = ET.parse(xml_file)
+                            tree = ET_parse(xml_file)
                             root = tree.getroot()
                             self._register_namespaces(root)
                             if self.preserve_structure:
@@ -233,12 +240,12 @@ class XMLCombiner:
                             # This is a workaround - proper handling would require
                             # more sophisticated parsing
                             try:
-                                tree = ET.parse(xml_file)
+                                tree = ET_parse(xml_file)
                                 root = tree.getroot()
                                 wrapper.append(root)
                             except:
                                 # If standard parsing fails, try iterparse
-                                context = ET.iterparse(xml_file, events=('start', 'end'))
+                                context = ET_iterparse(xml_file, events=('start', 'end'))
                                 roots_found = []
                                 for event, elem in context:
                                     if event == 'start' and elem.getparent() is None:
@@ -262,7 +269,7 @@ class XMLCombiner:
                     logger.debug(f"SAX parsing failed, using standard parser: {sax_error}")
                 
                 # Standard single-root parsing
-                tree = ET.parse(xml_file)
+                tree = ET_parse(xml_file)
                 root = tree.getroot()
                 
                 # Register namespaces
@@ -318,8 +325,37 @@ class XMLCombiner:
         
         return self.processed_files > 0
 
+    def _resolve_safe_output(self) -> Optional[Path]:
+        """Resolve the output path, rejecting relative-path traversal.
+
+        Relative output paths must stay under the current working directory
+        (the intended base). Absolute paths are treated as an explicit,
+        deliberate operator choice and are allowed as-is. This blocks
+        ``../../etc/passwd``-style traversal via a relative ``--output``.
+        """
+        base = Path.cwd().resolve()
+        try:
+            resolved = self.output_file.resolve()
+        except OSError as e:
+            logger.error(f"Invalid output path {self.output_file}: {e}")
+            return None
+
+        if not self.output_file.is_absolute():
+            if not (resolved == base or base in resolved.parents):
+                logger.error(
+                    f"Refusing to write outside working directory: "
+                    f"{self.output_file} -> {resolved}"
+                )
+                return None
+        return resolved
+
     def save_combined_xml(self) -> bool:
         try:
+            safe_output = self._resolve_safe_output()
+            if safe_output is None:
+                return False
+            self.output_file = safe_output
+
             # Create output directory if it doesn't exist
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
 
