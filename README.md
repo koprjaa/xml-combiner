@@ -1,88 +1,82 @@
 # xml-combiner
 
-**Merge a directory of XML files into one, with namespaces preserved, duplicates optional, and zero external dependencies.**
+Merges a directory of XML files into one file. It keeps namespaces, detects files with more than one root element, and can remove duplicate elements.
 
-![python](https://img.shields.io/badge/python-3.6+-3776AB?style=flat-square&logo=python&logoColor=white)
+![python](https://img.shields.io/badge/python-3.8+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-A31F34?style=flat-square)
 ![status](https://img.shields.io/badge/status-stable-22863A?style=flat-square)
-![stdlib-only](https://img.shields.io/badge/deps-stdlib%20only-555?style=flat-square)
 
-Stdlib-only. No `pip install` surprises, no `lxml` compile nightmares. Just `python main.py <dir>` and you have one combined file.
+## Install
 
-## Quick start
+```bash
+pip install -r requirements.txt
+```
+
+The only dependency is [defusedxml](https://pypi.org/project/defusedxml/), which blocks entity expansion and external entity attacks in untrusted XML. Everything else comes from the standard library.
+
+## Use
+
+Parse every `.xml` file in a directory and write one combined file:
 
 ```bash
 python main.py ./xmls -o combined.xml
 ```
 
-That's it for the default case — parse every `.xml` in `./xmls`, wrap their roots under `<combined>`, write to `combined.xml`.
-
-## Cookbook
-
-Flatten a directory of RSS-style feeds, de-dup items, walk subdirs:
+Walk subdirectories, remove duplicate elements, and rename the wrapper:
 
 ```bash
-python main.py ./feeds -o all-items.xml \
-  --recursive --deduplicate --root-element items --flatten
+python main.py ./feeds -o all-items.xml --recursive --deduplicate --root-element items --flatten
 ```
 
-Validate against a schema before combining (fail the run if any file doesn't match):
+Validate against a schema first. The run fails if a file does not match:
 
 ```bash
 python main.py ./invoices -o merged.xml --validate-schema ./invoice.xsd
 ```
 
-Aggressive retries for a flaky network-mounted directory:
+Raise the retry count for a slow network share:
 
 ```bash
 python main.py /mnt/slow-nas -o out.xml --max-retries 5 --verbose
 ```
 
-Keep each file's full root structure (default — nothing is dropped):
-
-```bash
-python main.py ./data -o combined.xml
-# → <combined><root>...file1...</root><root>...file2...</root></combined>
-```
-
-vs. `--flatten`, which extracts only the direct children of each root:
-
-```bash
-python main.py ./data -o combined.xml --flatten
-# → <combined>...file1 children...file2 children...</combined>
-```
-
-## Features worth knowing about
-
-- **Namespace preservation.** Every `xmlns:*` declaration found in the inputs is registered with `ET.register_namespace()` so prefixes survive the round-trip.
-- **Multi-root detection.** A SAX pre-pass catches files with more than one root element (which plain ElementTree would reject) and handles them gracefully.
-- **Deduplication.** `--deduplicate` hashes the full element tree (tag + attributes + recursive children) with MD5 and skips repeats across files.
-- **Per-file retry loop.** Default 3 attempts before giving up on a file; the run continues with the remaining inputs. Final log line reports `N of M processed`.
-- **Structured logging.** `INFO` for file counts, `DEBUG` (`-v`) for per-file tracing, `WARNING` for parse errors and duplicate roots.
-
-## All flags
+By default each input keeps its root element:
 
 ```
-usage: main.py [-h] [-o OUTPUT] [-r ROOT_ELEMENT] [-v] [--recursive]
-               [--validate-schema VALIDATE_SCHEMA] [--deduplicate] [--flatten]
-               [--max-retries MAX_RETRIES]
-               input_folder
+<combined><root>...file1...</root><root>...file2...</root></combined>
 ```
 
-| flag | default | effect |
-|------|---------|--------|
-| `-o, --output` | `combined.xml` | output file path |
-| `-r, --root-element` | `combined` | wrapper element name |
-| `-v, --verbose` | off | enable DEBUG logging |
-| `--recursive` | off | walk subdirectories |
-| `--validate-schema <path>` | — | XSD/DTD to validate against |
-| `--deduplicate` | off | hash + skip identical elements |
-| `--flatten` | off | drop root element wrappers |
-| `--max-retries <n>` | 3 | per-file retry attempts |
+With `--flatten` the tool takes the direct children of each root and drops the wrapper:
 
-## Why stdlib only
+```
+<combined>...file1 children...file2 children...</combined>
+```
 
-Using `lxml` would buy faster XPath and full XSD validation, but it also drags in C compile steps that break on fresh Windows environments, locked-down CI runners, and minimal containers. For the 80% case — combining hundreds of modestly-sized XML files — `xml.etree.ElementTree` + `xml.sax` is fast enough and installs instantly everywhere.
+## Options
+
+| Flag | Default | Effect |
+|---|---|---|
+| `-o, --output` | `combined.xml` | Output file path. |
+| `-r, --root-element` | `combined` | Name of the wrapper element. |
+| `-v, --verbose` | off | Enable DEBUG logging. |
+| `--recursive` | off | Walk subdirectories. |
+| `--validate-schema <path>` | none | XSD or DTD to validate against. |
+| `--deduplicate` | off | Hash elements and skip repeats. |
+| `--flatten` | off | Drop the root element of each input. |
+| `--max-retries <n>` | 3 | Retry attempts per file. |
+
+## How it works
+
+- Every `xmlns:*` declaration found in the inputs goes to `ET.register_namespace()`, so prefixes survive the round trip.
+- A SAX pre-pass finds files with more than one root element. Plain ElementTree rejects those files.
+- `--deduplicate` hashes the element tree, which covers tag, attributes, and children, then skips repeats across files.
+- Each file gets up to three attempts. The run continues with the other inputs. The last log line reports how many files of the total were processed.
+
+The tool uses `xml.etree.ElementTree` and `xml.sax` instead of `lxml`. `lxml` gives faster XPath and full XSD validation, but it needs a C compile step that breaks on fresh Windows machines, restricted CI runners, and minimal containers. For hundreds of moderate XML files the standard library parser is fast enough and installs everywhere.
+
+## Limits
+
+Schema validation is limited to what `xml.etree` supports. Full XSD validation needs `lxml`. The tool holds the combined tree in memory, so the output size is bound by RAM.
 
 ## License
 
