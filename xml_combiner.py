@@ -1,10 +1,16 @@
-"""
-Project: xml-combiner
-File: xml_combiner.py
-Description: Core module for combining multiple XML files into a single XML file.
-Author: Jan Alexandr Kopřiva jan.alexandr.kopriva@gmail.com
-License: MIT
-"""
+#
+# Project: xml-combiner
+# File:    xml_combiner.py
+#
+# Description:
+# Combines every XML file in a directory into one document, merging namespace prefixes and optionally dropping duplicate elements.
+#
+# Author:
+# Jan Alexandr Kopřiva
+# jan.alexandr.kopriva@gmail.com
+#
+# License: MIT
+#
 
 import hashlib
 import io

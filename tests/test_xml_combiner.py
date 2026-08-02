@@ -1,3 +1,17 @@
+#
+# Project: xml-combiner
+# File:    test_xml_combiner.py
+#
+# Description:
+# Tests for element hashing, encoding detection, multi-root parsing, and the combine step.
+#
+# Author:
+# Jan Alexandr Kopřiva
+# jan.alexandr.kopriva@gmail.com
+#
+# License: MIT
+#
+
 """Tests for the xml-combiner core module."""
 
 import xml.etree.ElementTree as ET

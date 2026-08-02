@@ -1,10 +1,16 @@
-"""
-Project: xml-combiner
-File: main.py
-Description: Command-line entry point for the XML combiner application.
-Author: Jan Alexandr Kopřiva jan.alexandr.kopriva@gmail.com
-License: MIT
-"""
+#
+# Project: xml-combiner
+# File:    main.py
+#
+# Description:
+# Command line entry point: parses the arguments, sets up logging, and runs the combiner.
+#
+# Author:
+# Jan Alexandr Kopřiva
+# jan.alexandr.kopriva@gmail.com
+#
+# License: MIT
+#
 
 import argparse
 import logging
