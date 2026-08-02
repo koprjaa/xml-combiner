@@ -6,73 +6,90 @@ Author: Jan Alexandr Kopřiva jan.alexandr.kopriva@gmail.com
 License: MIT
 """
 
-import os
+import hashlib
+import io
 import logging
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional, List, Set, Dict, Tuple
 from xml.etree.ElementTree import Element
-import hashlib
-import xml.sax
-from xml.sax.handler import ContentHandler
-import io
 
-# Use defusedxml to defend against entity-expansion ("billion laughs")
-# and external-entity DoS attacks when parsing untrusted input files.
-# These are drop-in replacements for the stdlib parsers used below.
-from defusedxml.ElementTree import parse as ET_parse
-from defusedxml.ElementTree import iterparse as ET_iterparse
-import defusedxml.sax
-
+# defusedxml defends against entity-expansion ("billion laughs") and external-entity
+# DoS when parsing untrusted input. Drop-in replacements for the stdlib parsers.
+from defusedxml.ElementTree import fromstring as defused_fromstring
+from defusedxml.ElementTree import iterparse as defused_iterparse
+from defusedxml.ElementTree import parse as defused_parse
 
 logger = logging.getLogger(__name__)
 
+# Matches the XML declaration and a DOCTYPE at the start of a document. Both are
+# legal only at the top level, so they must come off before the text is wrapped.
+_PROLOG_RE = re.compile(r"\A\s*(?:<\?xml[^>]*\?>\s*)?(?:<!DOCTYPE[^>\[]*(?:\[[^\]]*\])?>\s*)?")
+_ENCODING_RE = re.compile(rb"\A\s*<\?xml[^>]*?encoding\s*=\s*[\"']([\w.-]+)[\"']")
 
-class MultiRootHandler(ContentHandler):
-    """SAX handler to detect and handle multiple root elements."""
+WRAPPER_TAG = "__xml_combiner_wrapper__"
 
-    def __init__(self):
-        super().__init__()
-        self.roots = []
-        self.current_root = None
-        self.depth = 0
-        self.namespaces = {}
 
-    def startElementNS(self, name, qname, attrs):
-        self.depth += 1
-        if self.depth == 1:
-            ns, local = name
-            self.current_root = {
-                'name': name,
-                'qname': qname,
-                'attrs': dict(attrs),
-                'children': []
-            }
-            self.roots.append(self.current_root)
-        elif self.current_root:
-            self.current_root['children'].append({
-                'name': name,
-                'qname': qname,
-                'attrs': dict(attrs)
-            })
+def element_hash(element: Element) -> str:
+    """Content hash of an element, covering tag, text, attributes and children."""
 
-    def endElementNS(self, name, qname):
-        self.depth -= 1
+    def serialize(elem: Element) -> str:
+        parts = [f"{elem.tag}:{elem.text or ''}"]
+        parts.extend(f"{key}={value}" for key, value in sorted(elem.attrib.items()))
+        parts.extend(serialize(child) for child in elem)
+        return "|".join(parts)
 
-    def startPrefixMapping(self, prefix, uri):
-        self.namespaces[prefix] = uri
+    # Not a security boundary, only duplicate detection.
+    return hashlib.md5(serialize(element).encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+def declared_encoding(raw: bytes) -> str:
+    """Encoding named in the XML declaration, or utf-8 when it does not say."""
+    match = _ENCODING_RE.match(raw)
+    return match.group(1).decode("ascii") if match else "utf-8"
+
+
+def parse_roots(xml_file: Path) -> tuple[list[Element], dict[str, str]]:
+    """Read one XML file and return its root elements and namespace prefixes.
+
+    A well-formed document has exactly one root. Files with several top-level
+    elements are not valid XML and ElementTree refuses them outright, so they are
+    re-read and parsed inside a synthetic wrapper element. Both cases come back
+    as a list, which lets the caller treat them the same way.
+    """
+    try:
+        roots = [defused_parse(xml_file).getroot()]
+        prefixes = _namespace_prefixes(xml_file)
+    except ET.ParseError:
+        raw = xml_file.read_bytes()
+        body = _PROLOG_RE.sub("", raw.decode(declared_encoding(raw), errors="replace"))
+        wrapped = f"<{WRAPPER_TAG}>{body}</{WRAPPER_TAG}>"
+        roots = list(defused_fromstring(wrapped))
+        if len(roots) > 1:
+            logger.warning("%s has %d root elements, keeping all of them", xml_file.name, len(roots))
+        prefixes = _namespace_prefixes(io.BytesIO(wrapped.encode("utf-8")))
+    return roots, prefixes
+
+
+def _namespace_prefixes(source) -> dict[str, str]:
+    """Prefix to URI map from a document. iterparse yields (event, data) pairs."""
+    return {prefix: uri for _, (prefix, uri) in defused_iterparse(source, events=("start-ns",))}
 
 
 class XMLCombiner:
     """Combines XML files from a directory into a single XML file."""
 
-    def __init__(self, input_folder: str, output_file: str,
-                 root_element_name: str = "combined",
-                 recursive: bool = False,
-                 validate_schema: Optional[str] = None,
-                 deduplicate: bool = False,
-                 preserve_structure: bool = True,
-                 max_retries: int = 3):
+    def __init__(
+        self,
+        input_folder: str,
+        output_file: str,
+        root_element_name: str = "combined",
+        recursive: bool = False,
+        validate_schema: str | None = None,
+        deduplicate: bool = False,
+        preserve_structure: bool = True,
+        max_retries: int = 3,
+    ):
         self.input_folder = Path(input_folder)
         self.output_file = Path(output_file)
         self.root_element_name = root_element_name
@@ -81,223 +98,105 @@ class XMLCombiner:
         self.deduplicate = deduplicate
         self.preserve_structure = preserve_structure
         self.max_retries = max_retries
-        
+
         self.combined_root = ET.Element(root_element_name)
-        self.seen_elements: Set[str] = set()
-        self.namespace_map: Dict[str, str] = {}
+        self.seen_elements: set[str] = set()
+        self.namespace_map: dict[str, str] = {}
         self.processed_files = 0
         self.failed_files = 0
 
     def validate_paths(self) -> bool:
         if not self.input_folder.exists():
-            logger.error(f"Input folder does not exist: {self.input_folder}")
+            logger.error("Input folder does not exist: %s", self.input_folder)
             return False
         if not self.input_folder.is_dir():
-            logger.error(f"Path is not a directory: {self.input_folder}")
+            logger.error("Path is not a directory: %s", self.input_folder)
             return False
         return True
 
-    def get_xml_files(self) -> List[Path]:
-        """Get XML files, optionally recursively."""
-        xml_files = []
-        
-        if self.recursive:
-            for root, dirs, files in os.walk(self.input_folder):
-                for filename in files:
-                    if filename.lower().endswith('.xml'):
-                        xml_files.append(Path(root) / filename)
-        else:
-            xml_files = [
-                self.input_folder / filename
-                for filename in os.listdir(self.input_folder)
-                if filename.lower().endswith('.xml')
-            ]
-        
-        logger.info(f"Found {len(xml_files)} XML files")
-        return sorted(xml_files)
+    def get_xml_files(self) -> list[Path]:
+        """XML files in the input folder, optionally including subdirectories."""
+        entries = self.input_folder.rglob("*") if self.recursive else self.input_folder.iterdir()
+        xml_files = sorted(p for p in entries if p.is_file() and p.suffix.lower() == ".xml")
+        logger.info("Found %d XML files", len(xml_files))
+        return xml_files
 
-    def _register_namespaces(self, element: Element) -> None:
-        """Register all namespaces from an element and its children."""
-        for prefix, uri in element.attrib.items():
-            if prefix.startswith('xmlns'):
-                if prefix == 'xmlns':
-                    prefix = ''
-                else:
-                    prefix = prefix[6:]  # Remove 'xmlns:' prefix
-                if uri not in self.namespace_map.values():
-                    self.namespace_map[prefix] = uri
-                    ET.register_namespace(prefix, uri)
-        
-        for child in element.iter():
-            for prefix, uri in child.attrib.items():
-                if prefix.startswith('xmlns'):
-                    if prefix == 'xmlns':
-                        prefix = ''
-                    else:
-                        prefix = prefix[6:]
-                    if uri not in self.namespace_map.values():
-                        self.namespace_map[prefix] = uri
-                        ET.register_namespace(prefix, uri)
+    def _register_prefixes(self, prefixes: dict[str, str]) -> None:
+        """Keep the prefix names the inputs used, instead of ET's ns0, ns1, ns2."""
+        for prefix, uri in prefixes.items():
+            if uri not in self.namespace_map.values():
+                self.namespace_map[prefix or ""] = uri
+                ET.register_namespace(prefix or "", uri)
 
-    def _get_element_hash(self, element: Element) -> str:
-        """Generate hash for element to detect duplicates."""
-        def element_to_string(elem):
-            parts = [f"{elem.tag}:{elem.text or ''}"]
-            for key, value in sorted(elem.attrib.items()):
-                parts.append(f"{key}={value}")
-            for child in elem:
-                parts.append(element_to_string(child))
-            return "|".join(parts)
-        
-        content = element_to_string(element)
-        return hashlib.md5(content.encode('utf-8')).hexdigest()
+    def _is_new(self, element: Element) -> bool:
+        """False when deduplication is on and this element was already added."""
+        if not self.deduplicate:
+            return True
+        digest = element_hash(element)
+        if digest in self.seen_elements:
+            logger.debug("Skipping duplicate element: %s", element.tag)
+            return False
+        self.seen_elements.add(digest)
+        return True
+
+    def _add_root(self, root: Element) -> None:
+        """Append one parsed root, honoring preserve_structure and deduplication."""
+        candidates = [root] if self.preserve_structure else list(root)
+        for element in candidates:
+            if self._is_new(element):
+                self.combined_root.append(element)
 
     def _validate_xml(self, xml_file: Path) -> bool:
-        """Validate XML against schema if provided."""
+        """Well-formedness gate for --validate-schema.
+
+        Full XSD validation needs lxml, which this project deliberately avoids.
+        The schema path is therefore only a switch that turns the check on.
+        """
         if not self.validate_schema:
             return True
-        
-        try:
-            schema_path = Path(self.validate_schema)
-            if not schema_path.exists():
-                logger.warning(f"Schema file not found: {schema_path}")
-                return True
-            
-            # Basic validation - full XSD validation would require lxml
-            # For now, we just check if file is well-formed
-            ET_parse(xml_file)
-            logger.debug(f"Validated {xml_file.name}")
+        if not Path(self.validate_schema).exists():
+            logger.warning("Schema file not found, skipping validation: %s", self.validate_schema)
             return True
-        except ET.ParseError as e:
-            logger.error(f"Validation failed for {xml_file.name}: {e}")
+        try:
+            parse_roots(xml_file)
+        except ET.ParseError:
+            logger.exception("Validation failed for %s", xml_file.name)
             return False
-
-
-    def _add_element_with_structure(self, element: Element) -> None:
-        """Add element preserving full structure."""
-        if self.deduplicate:
-            element_hash = self._get_element_hash(element)
-            if element_hash in self.seen_elements:
-                logger.debug(f"Skipping duplicate element: {element.tag}")
-                return
-            self.seen_elements.add(element_hash)
-        
-        self._register_namespaces(element)
-        self.combined_root.append(element)
-
-    def _add_element_children(self, element: Element) -> None:
-        """Add only direct children of element (legacy behavior)."""
-        self._register_namespaces(element)
-        for child in element:
-            if self.deduplicate:
-                child_hash = self._get_element_hash(child)
-                if child_hash in self.seen_elements:
-                    logger.debug(f"Skipping duplicate element: {child.tag}")
-                    continue
-                self.seen_elements.add(child_hash)
-            
-            self.combined_root.append(child)
+        else:
+            logger.debug("Validated %s", xml_file.name)
+            return True
 
     def _process_xml_file(self, xml_file: Path) -> bool:
-        """Process a single XML file with error recovery and multiple root support."""
-        # Validate if schema provided
+        """Parse one file into the combined tree.
+
+        Only OSError is retried. A read over a network share can fail once and
+        succeed on the next attempt, but a malformed document parses the same way
+        every time, so retrying a ParseError only repeats the same failure.
+        """
         if not self._validate_xml(xml_file):
             return False
-        
-        # Try to parse with standard ElementTree with retries
-        for attempt in range(self.max_retries):
+
+        for attempt in range(1, self.max_retries + 1):
             try:
-                # First, check for multiple root elements using SAX
-                handler = MultiRootHandler()
-                parser = defusedxml.sax.make_parser()
-                parser.setContentHandler(handler)
-                parser.setFeature(xml.sax.handler.feature_namespaces, True)
-                
-                try:
-                    parser.parse(str(xml_file))
-                    if len(handler.roots) > 1:
-                        logger.warning(f"File {xml_file.name} has {len(handler.roots)} root elements, processing each separately")
-                        # For multiple roots, we need to parse the file differently
-                        # Read file content and split/process multiple roots
-                        with open(xml_file, 'rb') as f:
-                            content = f.read()
-                        
-                        # Try to parse as single root first (most common case)
-                        # If that fails, handle multiple roots
-                        try:
-                            tree = ET_parse(xml_file)
-                            root = tree.getroot()
-                            self._register_namespaces(root)
-                            if self.preserve_structure:
-                                self._add_element_with_structure(root)
-                            else:
-                                self._add_element_children(root)
-                            return True
-                        except:
-                            # Multiple roots detected - wrap them
-                            wrapper = ET.Element(f"{self.root_element_name}_wrapper")
-                            # Parse file and extract all top-level elements
-                            # This is a workaround - proper handling would require
-                            # more sophisticated parsing
-                            try:
-                                tree = ET_parse(xml_file)
-                                root = tree.getroot()
-                                wrapper.append(root)
-                            except:
-                                # If standard parsing fails, try iterparse
-                                context = ET_iterparse(xml_file, events=('start', 'end'))
-                                roots_found = []
-                                for event, elem in context:
-                                    if event == 'start' and elem.getparent() is None:
-                                        roots_found.append(elem)
-                                        if len(roots_found) > 1:
-                                            break
-                                
-                                if len(roots_found) > 1:
-                                    for root_elem in roots_found:
-                                        wrapper.append(root_elem)
-                            
-                            self._register_namespaces(wrapper)
-                            if self.preserve_structure:
-                                self.combined_root.append(wrapper)
-                            else:
-                                for child in wrapper:
-                                    self.combined_root.append(child)
-                            return True
-                except Exception as sax_error:
-                    # SAX parsing failed, fall through to standard parsing
-                    logger.debug(f"SAX parsing failed, using standard parser: {sax_error}")
-                
-                # Standard single-root parsing
-                tree = ET_parse(xml_file)
-                root = tree.getroot()
-                
-                # Register namespaces
-                self._register_namespaces(root)
-                
-                # Add element(s)
-                if self.preserve_structure:
-                    self._add_element_with_structure(root)
-                else:
-                    self._add_element_children(root)
-                
-                return True
-                
-            except ET.ParseError as e:
-                if attempt < self.max_retries - 1:
-                    logger.warning(f"Parse error (attempt {attempt + 1}/{self.max_retries}) in {xml_file.name}: {e}")
+                roots, prefixes = parse_roots(xml_file)
+            except OSError as exc:
+                if attempt < self.max_retries:
+                    logger.warning(
+                        "Read error (attempt %d/%d) on %s: %s",
+                        attempt, self.max_retries, xml_file.name, exc,
+                    )
                     continue
-                else:
-                    logger.error(f"Parse error in {xml_file.name} after {self.max_retries} attempts: {e}")
-                    return False
-            except Exception as e:
-                if attempt < self.max_retries - 1:
-                    logger.warning(f"Error (attempt {attempt + 1}/{self.max_retries}) processing {xml_file.name}: {e}")
-                    continue
-                else:
-                    logger.error(f"Unexpected error processing {xml_file.name} after {self.max_retries} attempts: {e}")
-                    return False
-        
+                logger.exception("Cannot read %s after %d attempts", xml_file.name, self.max_retries)
+                return False
+            except ET.ParseError:
+                logger.exception("Malformed XML in %s", xml_file.name)
+                return False
+
+            self._register_prefixes(prefixes)
+            for root in roots:
+                self._add_root(root)
+            return True
+
         return False
 
     def combine_xml_files(self) -> bool:
@@ -311,21 +210,21 @@ class XMLCombiner:
 
         self.processed_files = 0
         self.failed_files = 0
-        
+
         for xml_file in xml_files:
             if self._process_xml_file(xml_file):
                 self.processed_files += 1
-                logger.debug(f"Processed file: {xml_file.name}")
+                logger.debug("Processed file: %s", xml_file.name)
             else:
                 self.failed_files += 1
 
-        logger.info(f"Successfully processed {self.processed_files} of {len(xml_files)} files")
-        if self.failed_files > 0:
-            logger.warning(f"Failed to process {self.failed_files} files")
-        
+        logger.info("Successfully processed %d of %d files", self.processed_files, len(xml_files))
+        if self.failed_files:
+            logger.warning("Failed to process %d files", self.failed_files)
+
         return self.processed_files > 0
 
-    def _resolve_safe_output(self) -> Optional[Path]:
+    def _resolve_safe_output(self) -> Path | None:
         """Resolve the output path, rejecting relative-path traversal.
 
         Relative output paths must stay under the current working directory
@@ -336,47 +235,37 @@ class XMLCombiner:
         base = Path.cwd().resolve()
         try:
             resolved = self.output_file.resolve()
-        except OSError as e:
-            logger.error(f"Invalid output path {self.output_file}: {e}")
+        except OSError:
+            logger.exception("Invalid output path %s", self.output_file)
             return None
 
-        if not self.output_file.is_absolute():
-            if not (resolved == base or base in resolved.parents):
-                logger.error(
-                    f"Refusing to write outside working directory: "
-                    f"{self.output_file} -> {resolved}"
-                )
-                return None
+        if not self.output_file.is_absolute() and not (resolved == base or base in resolved.parents):
+            logger.error(
+                "Refusing to write outside working directory: %s -> %s",
+                self.output_file, resolved,
+            )
+            return None
         return resolved
 
     def save_combined_xml(self) -> bool:
+        safe_output = self._resolve_safe_output()
+        if safe_output is None:
+            return False
+        self.output_file = safe_output
+
         try:
-            safe_output = self._resolve_safe_output()
-            if safe_output is None:
-                return False
-            self.output_file = safe_output
-
-            # Create output directory if it doesn't exist
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
-
-            # Register all namespaces in the final tree
             for prefix, uri in self.namespace_map.items():
                 ET.register_namespace(prefix, uri)
-            
-            combined_tree = ET.ElementTree(self.combined_root)
-            combined_tree.write(
-                self.output_file,
-                encoding='utf-8',
-                xml_declaration=True,
-                method='xml'
+            ET.ElementTree(self.combined_root).write(
+                self.output_file, encoding="utf-8", xml_declaration=True, method="xml"
             )
-            logger.info(f"Combined XML file saved: {self.output_file}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving file: {e}")
+        except OSError:
+            logger.exception("Error saving file %s", self.output_file)
             return False
+        else:
+            logger.info("Combined XML file saved: %s", self.output_file)
+            return True
 
     def run(self) -> bool:
-        if not self.combine_xml_files():
-            return False
-        return self.save_combined_xml()
+        return self.combine_xml_files() and self.save_combined_xml()

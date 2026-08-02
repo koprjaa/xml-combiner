@@ -9,7 +9,6 @@ License: MIT
 import argparse
 import logging
 import sys
-from pathlib import Path
 
 from xml_combiner import XMLCombiner
 
