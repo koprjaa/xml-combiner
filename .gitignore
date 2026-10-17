@@ -1,4 +1,20 @@
-# Python
+# Project: xml-combiner
+# File: .gitignore
+# Description: Ignore build output, local tools, and editor files.
+# Author: Jan Alexandr Kopřiva
+# License: MIT
+/target/
+/.cargo/
+/.rustup/
+/.tmp/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+/combined.xml
 __pycache__/
 *.py[cod]
 *$py.class
@@ -19,29 +35,11 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Virtual environments
 venv/
 env/
 ENV/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Output files
 *.xml
 !example*.xml
-
-
-# Tooling caches
 .pytest_cache/
 .ruff_cache/
 uv.lock

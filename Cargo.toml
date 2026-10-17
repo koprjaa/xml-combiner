@@ -1,0 +1,19 @@
+# Project: xml-combiner
+# File: Cargo.toml
+# Description: Rust package and dependency definitions.
+# Author: Jan Alexandr Kopřiva
+# License: MIT
+[package]
+name = "xml-combiner"
+version = "1.0.0"
+edition = "2021"
+authors = ["Jan Alexandr Kopřiva"]
+license = "MIT"
+description = "Combine XML files while preserving namespaces and structure"
+
+[dependencies]
+quick-xml = { version = "0.38", features = ["encoding"] }
+encoding_rs = "0.8"
+tempfile = "3"
+libc = "0.2"
+
