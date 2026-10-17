@@ -9,7 +9,7 @@ version = "1.0.0"
 edition = "2021"
 authors = ["Jan Alexandr Kopřiva"]
 license = "MIT"
-description = "Combine XML files while preserving namespaces and structure"
+description = "Merges a folder of XML files into one document."
 
 [dependencies]
 quick-xml = { version = "0.38", features = ["encoding"] }
