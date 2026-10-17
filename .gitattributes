@@ -1,2 +1,6 @@
-# Fixtures are compared byte for byte; keep line endings as committed.
+# Project: xml-combiner
+# File: .gitattributes
+# Description: Preserve exact fixture bytes across platforms.
+# Author: Jan Alexandr Kopřiva
+# License: MIT
 tests/fixtures/** -text

@@ -178,3 +178,169 @@ fn dangling_output_symlinks_are_resolved_before_checking_boundaries() {
     .success());
     assert!(target.exists());
 }
+
+#[test]
+fn option_values_accept_dash_and_negative_decimal_paths() {
+    let d = tempdir().unwrap();
+    fs::create_dir(d.path().join("in")).unwrap();
+    fs::write(d.path().join("in/a.xml"), "<r/>").unwrap();
+    for name in ["-", "-1.5", "-.5"] {
+        let result = invoke(d.path(), &["in", "-o", name]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(d.path().join(name).exists());
+    }
+}
+
+#[test]
+fn empty_input_means_current_directory_and_empty_schema_is_disabled() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("a.xml"), "<r/>").unwrap();
+    let result = invoke(d.path(), &["", "--validate-schema", ""]);
+    assert!(result.status.success());
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("Schema file not found"));
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_arguments_report_usage_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+    let result = Command::new(env!("CARGO_BIN_EXE_xml-combiner"))
+        .arg(std::ffi::OsString::from_vec(vec![0xff]))
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("arguments must be valid Unicode"));
+}
+
+#[test]
+fn excessive_nesting_does_not_abort_other_files() {
+    let d = tempdir().unwrap();
+    fs::create_dir(d.path().join("in")).unwrap();
+    fs::write(
+        d.path().join("in/a.xml"),
+        format!("{}{}", "<r>".repeat(30000), "</r>".repeat(30000)),
+    )
+    .unwrap();
+    fs::write(d.path().join("in/b.xml"), "<ok/>").unwrap();
+    for flags in [vec![], vec!["--deduplicate"], vec!["--flatten"]] {
+        let mut args = vec!["in"];
+        args.extend(flags);
+        let result = invoke(d.path(), &args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Failed to process 1 files"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recursive_discovery_skips_permission_denied_subdirectories() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    let d = tempdir().unwrap();
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    fs::create_dir(d.path().join("in")).unwrap();
+    fs::write(d.path().join("in/good.xml"), "<ok/>").unwrap();
+    let locked = d.path().join("in/locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("hidden.xml"), "<hidden/>").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o0)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xml-combiner"));
+    command.current_dir(d.path()).args(["in", "--recursive"]);
+    // Root bypasses permission bits, so run the fixture with an unprivileged UID.
+    if unsafe { libc::geteuid() } == 0 {
+        command.uid(65534).gid(65534);
+    }
+    let result = command.output().unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(d.path().join("combined.xml")).unwrap(),
+        "<?xml version='1.0' encoding='utf-8'?>\n<combined><ok /></combined>"
+    );
+}
+
+#[test]
+fn retry_counts_accept_python_decimal_syntax_and_large_values() {
+    let d = tempdir().unwrap();
+    fs::create_dir(d.path().join("in")).unwrap();
+    fs::write(d.path().join("in/a.xml"), "<r/>").unwrap();
+    for value in ["1_0", " 2 ", "١٢", "9999999999999999999999999999999"] {
+        assert!(
+            invoke(d.path(), &["in", "--max-retries", value])
+                .status
+                .success(),
+            "{value}"
+        );
+    }
+    for value in ["1__0", "_1", "1_", "+", ""] {
+        assert_eq!(
+            invoke(d.path(), &["in", "--max-retries", value])
+                .status
+                .code(),
+            Some(2),
+            "{value}"
+        );
+    }
+    assert_eq!(
+        invoke(
+            d.path(),
+            &["in", "--max-retries", "-9999999999999999999999999999999"]
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert!(invoke(d.path(), &["in", "-o", "-١.٢"]).status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_destination_is_not_replaced() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    let d = tempdir().unwrap();
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    fs::create_dir(d.path().join("in")).unwrap();
+    fs::write(d.path().join("in/a.xml"), "<r/>").unwrap();
+    let output = d.path().join("out.xml");
+    fs::write(&output, "old output").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o444)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xml-combiner"));
+    command.current_dir(d.path()).args(["in", "-o", "out.xml"]);
+    if unsafe { libc::geteuid() } == 0 {
+        command.uid(65534).gid(65534);
+    }
+    let result = command.output().unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert_eq!(fs::read_to_string(&output).unwrap(), "old output");
+    assert_eq!(fs::read_dir(d.path()).unwrap().count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn excessive_output_symlink_chains_fail_cleanly() {
+    let d = tempdir().unwrap();
+    fs::create_dir(d.path().join("in")).unwrap();
+    fs::write(d.path().join("in/a.xml"), "<r/>").unwrap();
+    for index in 0..45 {
+        std::os::unix::fs::symlink(
+            format!("link{}", index + 1),
+            d.path().join(format!("link{index}")),
+        )
+        .unwrap();
+    }
+    let result = invoke(d.path(), &["in", "-o", "link0"]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(!d.path().join("link45").exists());
+}

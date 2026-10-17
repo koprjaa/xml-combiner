@@ -15,6 +15,7 @@
 .DS_Store
 Thumbs.db
 /combined.xml
+!/tests/fixtures/
 __pycache__/
 *.py[cod]
 *$py.class

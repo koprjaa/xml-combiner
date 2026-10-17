@@ -79,22 +79,31 @@ pub fn element_key(e: &Element) -> Element {
 }
 
 pub fn declared_encoding(raw: &[u8]) -> String {
-    let s = String::from_utf8_lossy(raw);
-    let s = s.trim_start();
-    if s.starts_with("<?xml") {
-        if let Some(end) = s.find("?>") {
-            if let Some((_, rest)) = s[..end].split_once("encoding") {
-                let rest = rest
-                    .trim_start()
-                    .strip_prefix('=')
-                    .unwrap_or("")
-                    .trim_start();
-                if let Some(q) = rest.chars().next().filter(|q| *q == '\'' || *q == '"') {
-                    if let Some(end) = rest[1..].find(q) {
-                        return rest[1..end + 1].to_owned();
-                    }
-                }
-            }
+    let raw = raw.trim_ascii_start();
+    let Some(body) = raw.strip_prefix(b"<?xml") else {
+        return "utf-8".into();
+    };
+    let body = &body[..body.iter().position(|b| *b == b'>').unwrap_or(body.len())];
+    for index in 0..body.len() {
+        let Some(rest) = body[index..].strip_prefix(b"encoding") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_ascii_start().strip_prefix(b"=") else {
+            continue;
+        };
+        let rest = rest.trim_ascii_start();
+        let Some((&quote, label)) = rest.split_first() else {
+            continue;
+        };
+        if !matches!(quote, b'\'' | b'"') {
+            continue;
+        }
+        let length = label
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+            .count();
+        if length > 0 && label.get(length) == Some(&quote) {
+            return String::from_utf8_lossy(&label[..length]).into_owned();
         }
     }
     "utf-8".into()
@@ -118,6 +127,30 @@ fn valid_name(name: &str) -> bool {
         chars.next().is_some_and(|c| c != ':' && xml_start(c)) && chars.all(|c| c != ':' && (xml_start(c) || matches!(c, '-' | '.' | '0'..='9' | '\u{b7}' | '\u{300}'..='\u{36f}' | '\u{203f}'..='\u{2040}')))
     };
     valid(parts.next().unwrap_or("")) && parts.next().is_none_or(valid) && parts.next().is_none()
+}
+fn xml_whitespace(text: &str) -> bool {
+    text.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+}
+fn separated_attributes(raw: &[u8]) -> bool {
+    let mut quote = None;
+    let mut closed = false;
+    for &byte in raw {
+        if let Some(q) = quote {
+            if byte == q {
+                quote = None;
+                closed = true;
+            }
+        } else {
+            if closed && !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                return false;
+            }
+            closed = false;
+            if byte == b'\'' || byte == b'"' {
+                quote = Some(byte);
+            }
+        }
+    }
+    true
 }
 fn valid_text(text: &str) -> Result<(), String> {
     if text.chars().all(|c| matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')) { Ok(()) }
@@ -172,6 +205,7 @@ enum Notice {
     Start(Element, bool),
     End,
     Text(String),
+    Fragment,
 }
 type Observer<'a> = Option<&'a mut dyn FnMut(Notice) -> Result<(), String>>;
 fn parse_file_with_sink(
@@ -185,8 +219,23 @@ fn parse_file_with_handlers(
     sink: Sink<'_>,
     observer: Observer<'_>,
 ) -> Result<(Vec<Element>, Prefixes, usize), String> {
-    use std::io::BufRead;
-    let mut source = BufReader::new(file);
+    use std::io::Read;
+    let mut source: Box<dyn io::BufRead> = Box::new(BufReader::new(file));
+    let first = source.fill_buf().map_err(read_error)?;
+    let starts_decl = first
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(first)
+        .starts_with(b"<?xml");
+    let mut header_label = None;
+    if starts_decl && !first.contains(&b'>') {
+        // A declaration can exceed the buffered reader's first chunk.
+        let mut header = Vec::new();
+        source.read_until(b'>', &mut header).map_err(read_error)?;
+        header_label = Some(declared_encoding(
+            header.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&header),
+        ));
+        source = Box::new(BufReader::new(io::Cursor::new(header).chain(source)));
+    }
     let first = source.fill_buf().map_err(read_error)?;
     let encoding = if first.starts_with(&[0xff, 0xfe]) || first.starts_with(&[b'<', 0]) {
         Some(encoding_rs::UTF_16LE)
@@ -198,7 +247,9 @@ fn parse_file_with_handlers(
     if let Some(encoding) = encoding {
         parse_transcoded(Transcoder::new(source, encoding), sink, observer)
     } else {
-        let label = declared_encoding(first.strip_prefix(b"\xef\xbb\xbf").unwrap_or(first));
+        let label = header_label.unwrap_or_else(|| {
+            declared_encoding(first.strip_prefix(b"\xef\xbb\xbf").unwrap_or(first))
+        });
         let normalized = label.to_ascii_lowercase().replace(['-', '_', '.'], "");
         let mode = match normalized.as_str() {
             "ascii" | "usascii" | "646" | "iso646us" | "ansix341968" | "ansix341986" | "cp367"
@@ -483,17 +534,24 @@ struct DtdCommentFilter<R> {
     tail: Vec<u8>,
     doctype: bool,
     comment: bool,
+    attlist: bool,
     quote: Option<u8>,
     brackets: usize,
     passthrough: bool,
+    pending: std::collections::VecDeque<u8>,
 }
 impl<R: io::BufRead> io::Read for DtdCommentFilter<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.passthrough {
+        if self.passthrough && self.pending.is_empty() {
             return self.source.read(out);
         }
         let mut written = 0;
         while written < out.len() {
+            if let Some(byte) = self.pending.pop_front() {
+                out[written] = byte;
+                written += 1;
+                continue;
+            }
             let input = self.source.fill_buf()?;
             if input.is_empty() {
                 break;
@@ -511,13 +569,28 @@ impl<R: io::BufRead> io::Read for DtdCommentFilter<R> {
                 } else if let Some(quote) = self.quote {
                     if byte == quote {
                         self.quote = None;
+                    } else if byte == b'<' && self.attlist {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unescaped < in DTD attribute default",
+                        ));
+                    } else if byte == b'>' || byte == b'<' {
+                        // quick-xml counts angle brackets even inside DTD literals.
+                        normalized = b'&';
+                        self.pending
+                            .extend(if byte == b'>' { b"gt;" } else { b"lt;" });
                     }
                 } else {
                     match byte {
                         b'\'' | b'"' => self.quote = Some(byte),
                         b'[' => self.brackets += 1,
                         b']' => self.brackets = self.brackets.saturating_sub(1),
-                        b'>' if self.brackets == 0 => self.doctype = false,
+                        b'>' => {
+                            self.attlist = false;
+                            if self.brackets == 0 {
+                                self.doctype = false;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -527,6 +600,9 @@ impl<R: io::BufRead> io::Read for DtdCommentFilter<R> {
             self.tail.push(byte);
             if self.tail.len() > 9 {
                 self.tail.remove(0);
+            }
+            if self.doctype && self.tail.ends_with(b"<!ATTLIST") {
+                self.attlist = true;
             }
             if !self.doctype && self.tail.ends_with(b"<!DOCTYPE") {
                 self.doctype = true;
@@ -553,9 +629,11 @@ fn parse_reader<R: io::BufRead>(
         tail: vec![],
         doctype: false,
         comment: false,
+        attlist: false,
         quote: None,
         brackets: 0,
         passthrough: false,
+        pending: std::collections::VecDeque::new(),
     };
     let mut reader = Reader::from_reader(BufReader::new(filtered));
     reader.config_mut().check_end_names = true;
@@ -567,16 +645,25 @@ fn parse_reader<R: io::BufRead>(
     let mut root_count = 0;
     let mut outside_text = false;
     let mut declaration_seen = false;
+    let mut misc_seen = false;
     let mut doctype_seen = false;
     let mut dtd = vec![];
     let mut prefixes = vec![];
     loop {
-        let event = reader
-            .read_event_into(&mut buf)
-            .map_err(|e| e.to_string())?;
+        let event = reader.read_event_into(&mut buf).map_err(|e| match e {
+            quick_xml::Error::Io(e) => read_error(e.as_ref()),
+            other => other.to_string(),
+        })?;
         match event {
             Event::Start(ref start) | Event::Empty(ref start) => {
                 let empty = matches!(event, Event::Empty(_));
+                if !separated_attributes(start.attributes_raw()) {
+                    return Err("attributes must be separated by whitespace".into());
+                }
+                // Tree cloning, hashing and dropping recurse; bound untrusted nesting.
+                if stack.len() >= 256 {
+                    return Err("XML nesting exceeds the limit of 256 elements".into());
+                }
                 if stack.is_empty() {
                     if let Some((callback, sink_flatten)) = sink.as_mut() {
                         for node in roots.drain(..) {
@@ -648,6 +735,7 @@ fn parse_reader<R: io::BufRead>(
                         if (!p.is_empty()
                             && (!valid_name(&p) || p.contains(':') || value.is_empty()))
                             || p == "xmlns"
+                            || value.contains('}')
                             || value == "http://www.w3.org/2000/xmlns/"
                             || ((p == "xml") != (value == "http://www.w3.org/XML/1998/namespace"))
                         {
@@ -714,7 +802,7 @@ fn parse_reader<R: io::BufRead>(
                 let value = t.xml10_content().map_err(|e| e.to_string())?;
                 let value = quick_xml::escape::unescape(&value).map_err(|e| e.to_string())?;
                 valid_text(&value)?;
-                if stack.is_empty() && !value.trim().is_empty() {
+                if stack.is_empty() && !xml_whitespace(&value) {
                     outside_text = true;
                 }
                 if let Some(notify) = observer.as_mut() {
@@ -724,9 +812,15 @@ fn parse_reader<R: io::BufRead>(
                 }
             }
             Event::CData(t) => {
+                if stack.is_empty() {
+                    outside_text = true;
+                    if let Some(notify) = observer.as_mut() {
+                        notify(Notice::Fragment)?;
+                    }
+                }
                 let value = t.xml10_content().map_err(|e| e.to_string())?;
                 valid_text(&value)?;
-                if stack.is_empty() && !value.trim().is_empty() {
+                if stack.is_empty() && !xml_whitespace(&value) {
                     outside_text = true;
                 }
                 if let Some(notify) = observer.as_mut() {
@@ -736,11 +830,17 @@ fn parse_reader<R: io::BufRead>(
                 }
             }
             Event::GeneralRef(r) => {
+                if stack.is_empty() {
+                    outside_text = true;
+                    if let Some(notify) = observer.as_mut() {
+                        notify(Notice::Fragment)?;
+                    }
+                }
                 let name = r.decode().map_err(|e| e.to_string())?;
                 let encoded = format!("&{name};");
                 let value = quick_xml::escape::unescape(&encoded).map_err(|e| e.to_string())?;
                 valid_text(&value)?;
-                if stack.is_empty() && !value.trim().is_empty() {
+                if stack.is_empty() && !xml_whitespace(&value) {
                     outside_text = true;
                 }
                 if let Some(notify) = observer.as_mut() {
@@ -749,7 +849,18 @@ fn parse_reader<R: io::BufRead>(
                     append_text(&mut stack, &mut roots, &value);
                 }
             }
+            Event::Comment(comment) => {
+                valid_text(&comment.xml10_content().map_err(|e| e.to_string())?)?;
+                misc_seen = true;
+            }
             Event::PI(pi) => {
+                valid_text(
+                    &reader
+                        .decoder()
+                        .decode(pi.as_ref())
+                        .map_err(|e| e.to_string())?,
+                )?;
+                misc_seen = true;
                 let target = reader
                     .decoder()
                     .decode(pi.target())
@@ -759,7 +870,13 @@ fn parse_reader<R: io::BufRead>(
                 }
             }
             Event::Decl(d) => {
-                if declaration_seen || doctype_seen || root_count != 0 || !stack.is_empty() {
+                if declaration_seen
+                    || misc_seen
+                    || outside_text
+                    || doctype_seen
+                    || root_count != 0
+                    || !stack.is_empty()
+                {
                     return Err("XML declaration not at start of document".into());
                 }
                 declaration_seen = true;
@@ -780,7 +897,6 @@ fn parse_reader<R: io::BufRead>(
                 dtd = dtd_attributes(&s)?;
             }
             Event::Eof => break,
-            _ => {}
         }
         buf.clear();
     }
@@ -838,7 +954,13 @@ pub struct Report {
 
 pub fn get_xml_files(input: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     fn visit(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) -> io::Result<()> {
-        for entry in fs::read_dir(dir)? {
+        let entries = match fs::read_dir(dir) {
+            Err(error) if recursive && error.kind() == io::ErrorKind::PermissionDenied => {
+                return Ok(())
+            }
+            result => result?,
+        };
+        for entry in entries {
             let entry = entry?;
             let path = entry.path();
             if path.is_file()
@@ -1017,6 +1139,7 @@ fn stream_open<W: Write>(frame: &mut StreamFrame, ns: &Prefixes, out: &mut W) ->
 impl<W: Write> StreamingSerializer<'_, W> {
     fn accept(&mut self, notice: Notice) -> io::Result<()> {
         match notice {
+            Notice::Fragment => {}
             Notice::Start(node, empty) => {
                 if let Some(parent) = self.frames.last_mut() {
                     parent.child_seen = true;
@@ -1076,7 +1199,15 @@ pub fn combine(options: &Options, report: &mut Report) -> Result<(), String> {
         .and_then(|s| s.rsplit_once('}'))
         .map(|(_, name)| name)
         .unwrap_or(&options.root);
-    if !valid_name(local_root) || (options.root.starts_with('{') && local_root.contains(':')) {
+    let invalid_uri = options
+        .root
+        .strip_prefix('{')
+        .and_then(|s| s.rsplit_once('}'))
+        .is_some_and(|(uri, _)| uri.is_empty() || valid_text(uri).is_err());
+    if invalid_uri
+        || !valid_name(local_root)
+        || (options.root.starts_with('{') && local_root.contains(':'))
+    {
         return Err(format!("Invalid root element name: {}", options.root));
     }
     if !options.input.exists() {
@@ -1126,6 +1257,7 @@ pub fn combine(options: &Options, report: &mut Report) -> Result<(), String> {
                     let mut depth = 0;
                     let mut collect = |notice: Notice| {
                         match notice {
+                            Notice::Fragment => fragment = true,
                             Notice::Start(node, empty) => {
                                 if !options.flatten || depth > 0 {
                                     collect_names(&node, &mut file_names);
@@ -1138,7 +1270,7 @@ pub fn combine(options: &Options, report: &mut Report) -> Result<(), String> {
                                 depth -= 1;
                             }
                             Notice::Text(text) => {
-                                if depth == 0 && !text.trim().is_empty() {
+                                if depth == 0 && !xml_whitespace(&text) {
                                     fragment = true;
                                 }
                             }
@@ -1312,6 +1444,11 @@ pub fn combine(options: &Options, report: &mut Report) -> Result<(), String> {
         .tempfile_in(output.parent().unwrap())
         .map_err(|e| format!("Error saving file {}: {e}", output.display()))?;
     if let Ok(metadata) = fs::metadata(&output) {
+        // Atomic replacement must still honor the destination's write permissions.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&output)
+            .map_err(|e| format!("Error saving file {}: {e}", output.display()))?;
         staging
             .as_file()
             .set_permissions(metadata.permissions())
@@ -1396,3 +1533,7 @@ pub fn combine(options: &Options, report: &mut Report) -> Result<(), String> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/reader/mod.rs"]
+mod reader_tests;

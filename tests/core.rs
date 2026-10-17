@@ -572,3 +572,43 @@ fn bound_prefixed_wrapper_names_are_preserved() {
     .0;
     assert_eq!(parse(&s).tag, "{urn:a}wrapper");
 }
+
+#[test]
+fn declared_encoding_matches_the_original_byte_pattern() {
+    for (raw, expected) in [
+        (b"<?xml encoding='latin1'".as_slice(), "latin1"),
+        (b"<?xml encoding='invalid label'?>".as_slice(), "utf-8"),
+        (b"\xc2\xa0<?xml encoding='latin1'?>".as_slice(), "utf-8"),
+        (b"<?xml xencoding='ISO-8859-2'?>".as_slice(), "ISO-8859-2"),
+    ] {
+        assert_eq!(declared_encoding(raw), expected);
+    }
+}
+
+#[test]
+fn namespace_uris_in_wrapper_names_must_be_valid() {
+    for root in ["{}r", "{\u{1}}r"] {
+        let (_d, mut options) = setup(&[("a.xml", "<r/>")]);
+        options.root = root.into();
+        assert!(combine(&options, &mut Report::default()).is_err());
+        assert!(!options.output.exists());
+    }
+}
+
+#[test]
+fn nesting_limit_is_checked_before_recursive_tree_operations() {
+    let d = tempdir().unwrap();
+    let path = write(
+        d.path(),
+        "depth.xml",
+        &format!("{}{}", "<r>".repeat(256), "</r>".repeat(256)),
+    );
+    let roots = parse_roots(&path).unwrap().0;
+    assert_eq!(element_key(&roots[0]).tag, "r");
+    write(
+        d.path(),
+        "depth.xml",
+        &format!("{}{}", "<r>".repeat(257), "</r>".repeat(257)),
+    );
+    assert!(parse_roots(&path).unwrap_err().contains("nesting"));
+}
