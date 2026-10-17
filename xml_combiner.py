@@ -189,7 +189,10 @@ class XMLCombiner:
                 if attempt < self.max_retries:
                     logger.warning(
                         "Read error (attempt %d/%d) on %s: %s",
-                        attempt, self.max_retries, xml_file.name, exc,
+                        attempt,
+                        self.max_retries,
+                        xml_file.name,
+                        exc,
                     )
                     continue
                 logger.exception("Cannot read %s after %d attempts", xml_file.name, self.max_retries)
@@ -248,7 +251,8 @@ class XMLCombiner:
         if not self.output_file.is_absolute() and not (resolved == base or base in resolved.parents):
             logger.error(
                 "Refusing to write outside working directory: %s -> %s",
-                self.output_file, resolved,
+                self.output_file,
+                resolved,
             )
             return None
         return resolved

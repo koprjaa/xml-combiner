@@ -23,8 +23,7 @@ from xml_combiner import XMLCombiner, declared_encoding, element_hash, parse_roo
 
 SINGLE_ROOT = '<?xml version="1.0"?><root><item id="1">A</item></root>'
 NAMESPACED = (
-    '<?xml version="1.0"?>'
-    '<feed xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></feed>'
+    '<?xml version="1.0"?><feed xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></feed>'
 )
 MULTI_ROOT = "<one>first</one>\n<two>second</two>"
 
