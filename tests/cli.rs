@@ -354,3 +354,13 @@ fn previous_output_inside_the_input_folder_is_not_combined_again() {
         "<?xml version='1.0' encoding='utf-8'?>\n<combined><a /></combined>"
     );
 }
+
+#[test]
+fn zero_max_retries_is_rejected_with_a_message() {
+    let d = tempdir().unwrap();
+    fs::create_dir(d.path().join("in")).unwrap();
+    fs::write(d.path().join("in/a.xml"), "<r/>").unwrap();
+    let r = invoke(d.path(), &["in", "--max-retries", "0"]);
+    assert_eq!(r.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&r.stderr).contains("--max-retries must be at least 1"));
+}

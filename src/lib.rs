@@ -1210,6 +1210,12 @@ pub fn combine(options: &Options, report: &mut Report) -> Result<(), String> {
     {
         return Err(format!("Invalid root element name: {}", options.root));
     }
+    if options.max_retries < 1 {
+        return Err(format!(
+            "--max-retries must be at least 1, got {}",
+            options.max_retries
+        ));
+    }
     if !options.input.exists() {
         return Err(format!(
             "Input folder does not exist: {}",
@@ -1224,8 +1230,16 @@ pub fn combine(options: &Options, report: &mut Report) -> Result<(), String> {
     }
     let mut files = get_xml_files(&options.input, options.recursive).map_err(|e| e.to_string())?;
     // A previous run's output inside the input folder must not be combined into the next one.
+    // When it is the only file, the caller is rewriting it in place, so keep it.
     if let Ok(output) = safe_output(&options.output) {
-        files.retain(|f| f.canonicalize().map_or(true, |f| f != output));
+        let others: Vec<_> = files
+            .iter()
+            .filter(|f| f.canonicalize().map_or(true, |f| f != output))
+            .cloned()
+            .collect();
+        if !others.is_empty() {
+            files = others;
+        }
     }
     log("INFO", &format!("Found {} XML files", files.len()));
     if files.is_empty() {
