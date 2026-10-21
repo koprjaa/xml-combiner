@@ -230,12 +230,9 @@ fn excessive_nesting_does_not_abort_other_files() {
         let mut args = vec!["in"];
         args.extend(flags);
         let result = invoke(d.path(), &args);
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        assert_eq!(result.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&result.stderr).contains("Failed to process 1 files"));
+        assert!(d.path().join("combined.xml").exists());
     }
 }
 

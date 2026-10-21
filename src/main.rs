@@ -269,7 +269,10 @@ fn main() {
     if options.input.as_os_str().is_empty() {
         options.input = ".".into();
     }
-    match combine(&options, &mut Report::default()) {
+    let mut report = Report::default();
+    match combine(&options, &mut report) {
+        // The output is written from the files that parsed, but a skipped file is still a failed run.
+        Ok(()) if report.failed_files > 0 => std::process::exit(1),
         Ok(()) => {}
         Err(e) => {
             if !e.is_empty() {
