@@ -1222,7 +1222,11 @@ pub fn combine(options: &Options, report: &mut Report) -> Result<(), String> {
             options.input.display()
         ));
     }
-    let files = get_xml_files(&options.input, options.recursive).map_err(|e| e.to_string())?;
+    let mut files = get_xml_files(&options.input, options.recursive).map_err(|e| e.to_string())?;
+    // A previous run's output inside the input folder must not be combined into the next one.
+    if let Ok(output) = safe_output(&options.output) {
+        files.retain(|f| f.canonicalize().map_or(true, |f| f != output));
+    }
     log("INFO", &format!("Found {} XML files", files.len()));
     if files.is_empty() {
         log("WARNING", "No XML files found to process");

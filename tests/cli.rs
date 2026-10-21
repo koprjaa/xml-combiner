@@ -344,3 +344,16 @@ fn excessive_output_symlink_chains_fail_cleanly() {
     assert_eq!(result.status.code(), Some(1));
     assert!(!d.path().join("link45").exists());
 }
+
+#[test]
+fn previous_output_inside_the_input_folder_is_not_combined_again() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("a.xml"), "<a/>").unwrap();
+    for _ in 0..2 {
+        assert!(invoke(d.path(), &["."]).status.success());
+    }
+    assert_eq!(
+        fs::read_to_string(d.path().join("combined.xml")).unwrap(),
+        "<?xml version='1.0' encoding='utf-8'?>\n<combined><a /></combined>"
+    );
+}
